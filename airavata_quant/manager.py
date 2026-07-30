@@ -196,22 +196,47 @@ class ModelManager:
     def _load_original(self) -> Any:
         logger.info("loading %s (original)", self.settings.model_name)
         on_cuda = self.device.type == "cuda"
+        dtype = torch.float16 if on_cuda else torch.float32
+
+        if on_cuda:
+            try:
+                return AutoModelForCausalLM.from_pretrained(
+                    self.settings.model_name,
+                    torch_dtype=dtype,
+                    device_map="auto",
+                    **self._hub_kwargs(),
+                )
+            except ImportError as exc:
+                # device_map="auto" needs accelerate, but a single-GPU host does
+                # not: load onto the CPU and move the whole model across.
+                logger.warning(
+                    "accelerate is unavailable (%s); falling back to a "
+                    "single-device load. Install accelerate for multi-GPU "
+                    "sharding and CPU offload.",
+                    exc,
+                )
+
         model = AutoModelForCausalLM.from_pretrained(
-            self.settings.model_name,
-            torch_dtype=torch.float16 if on_cuda else torch.float32,
-            device_map="auto" if on_cuda else None,
-            **self._hub_kwargs(),
+            self.settings.model_name, torch_dtype=dtype, **self._hub_kwargs()
         )
-        return model if on_cuda else model.to(self.device)
+        return model.to(self.device)
 
     def _load_bnb(self, variant: Variant) -> Any:
         logger.info("loading %s (%s)", self.settings.model_name, variant.name)
-        return AutoModelForCausalLM.from_pretrained(
-            self.settings.model_name,
-            quantization_config=build_bnb_config(variant),
-            device_map="auto",
-            **self._hub_kwargs(),
-        )
+        try:
+            return AutoModelForCausalLM.from_pretrained(
+                self.settings.model_name,
+                quantization_config=build_bnb_config(variant),
+                device_map="auto",
+                **self._hub_kwargs(),
+            )
+        except ImportError as exc:
+            # Unlike the FP baseline there is no fallback here: bitsandbytes
+            # quantization is applied during the accelerate-driven load.
+            raise ModelLoadError(
+                f"{variant.name} needs accelerate and bitsandbytes: "
+                f"pip install 'airavata-quant[gpu]' ({exc})"
+            ) from exc
 
     def _load_dynamic_quant(self) -> Any:
         logger.info("applying dynamic quantization on CPU")

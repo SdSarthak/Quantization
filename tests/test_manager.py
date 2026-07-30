@@ -219,3 +219,81 @@ def test_shutdown_clears_state(manager):
     manager.shutdown()
     assert manager.models == {}
     assert manager.tokenizer is None
+
+
+class _NoDeviceModel:
+    """Stand-in for a model loaded without accelerate's device_map."""
+
+    def __init__(self):
+        self.moved_to = None
+
+    def to(self, device):
+        self.moved_to = device
+        return self
+
+    def eval(self):
+        return self
+
+
+def _fake_auto_class(fail_on_device_map: bool):
+    class FakeAuto:
+        calls = []
+
+        @staticmethod
+        def from_pretrained(name, **kwargs):
+            FakeAuto.calls.append(kwargs)
+            if fail_on_device_map and "device_map" in kwargs:
+                raise ImportError(
+                    "Using `low_cpu_mem_usage=True` or a `device_map` requires Accelerate"
+                )
+            return _NoDeviceModel()
+
+    return FakeAuto
+
+
+def _cuda_manager(monkeypatch, settings, fake_auto):
+    import airavata_quant.manager as manager_module
+
+    from .conftest import FakeTokenizer
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(manager_module, "AutoModelForCausalLM", fake_auto)
+    settings.device = "cuda"
+    instance = ModelManager(settings)
+    monkeypatch.setattr(instance, "load_tokenizer", lambda: FakeTokenizer())
+    return instance
+
+
+def test_original_falls_back_to_a_single_device_load_without_accelerate(
+    monkeypatch, settings
+):
+    fake_auto = _fake_auto_class(fail_on_device_map=True)
+    instance = _cuda_manager(monkeypatch, settings, fake_auto)
+
+    model = instance.ensure_loaded("original")
+
+    assert len(fake_auto.calls) == 2
+    assert fake_auto.calls[0]["device_map"] == "auto"
+    assert "device_map" not in fake_auto.calls[1]
+    assert model.moved_to.type == "cuda"
+
+
+def test_original_prefers_device_map_when_accelerate_is_present(monkeypatch, settings):
+    fake_auto = _fake_auto_class(fail_on_device_map=False)
+    instance = _cuda_manager(monkeypatch, settings, fake_auto)
+
+    instance.ensure_loaded("original")
+
+    assert len(fake_auto.calls) == 1
+    assert fake_auto.calls[0]["device_map"] == "auto"
+
+
+def test_quantized_variants_report_an_actionable_missing_dependency_error(
+    monkeypatch, settings
+):
+    fake_auto = _fake_auto_class(fail_on_device_map=True)
+    instance = _cuda_manager(monkeypatch, settings, fake_auto)
+
+    with pytest.raises(ModelLoadError) as excinfo:
+        instance.ensure_loaded("int4")
+    assert "airavata-quant[gpu]" in str(excinfo.value)
