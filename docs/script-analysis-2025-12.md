@@ -1,7 +1,26 @@
 # Airavata Quantization Script Analysis Report
 
+> **Historical document.** This reviewed the original single-file
+> `airavata_quantization_service.py` before the code was split into the
+> `airavata_quant` package. Most of its recommendations have since been
+> implemented (token-level prompt stripping, shutdown cleanup, request
+> validation, configurable host/port). Two things it got wrong are worth
+> recording:
+>
+> - It reported **0 critical bugs**. There were two. `/benchmark/all` was
+>   declared *after* `/benchmark/{model_type}`, so FastAPI matched the
+>   parameterised route first and the documented endpoint always 404'd. And
+>   `BenchmarkResponse` typed `hardware_info` as `Dict[str, str]` while the
+>   handler put integers and floats in it, so every successful benchmark failed
+>   response validation under Pydantic v2.
+> - It recommended adding `numpy` to the manifest. The dependency was instead
+>   removed: the percentile and aggregation logic in `airavata_quant/benchmark.py`
+>   is a few lines of pure Python.
+>
+> See the README for how the service works now.
+
 **Date:** December 20, 2025  
-**Script:** airavata_quantization_service.py  
+**Script:** airavata_quantization_service.py (pre-refactor)  
 **System:** Windows  
 
 ---

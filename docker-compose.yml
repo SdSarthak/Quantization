@@ -1,0 +1,44 @@
+services:
+  airavata-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: airavata-quant:gpu
+    ports:
+      - "8000:8000"
+    volumes:
+      - model-cache:/models
+    environment:
+      AIRAVATA_DEVICE: cuda
+      AIRAVATA_PRELOAD: auto
+      AIRAVATA_LOG_LEVEL: INFO
+      # Set in a .env file next to this compose file for gated repositories.
+      AIRAVATA_HF_TOKEN: ${AIRAVATA_HF_TOKEN:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  airavata-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    image: airavata-quant:cpu
+    ports:
+      - "8001:8000"
+    volumes:
+      - model-cache:/models
+    environment:
+      AIRAVATA_DEVICE: cpu
+      # The FP32 baseline needs a lot of RAM; load it only when asked for.
+      AIRAVATA_PRELOAD: none
+      AIRAVATA_LOG_LEVEL: INFO
+      AIRAVATA_HF_TOKEN: ${AIRAVATA_HF_TOKEN:-}
+    restart: unless-stopped
+
+volumes:
+  model-cache:
