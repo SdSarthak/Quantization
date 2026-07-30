@@ -1,0 +1,52 @@
+# Secrets / credentials
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+credentials.json
+serviceAccount*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+venv/
+env/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Model weights / caches / datasets
+model_cache/
+quantized_models/
+*.h5
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.gguf
+*.onnx
+*.pkl
+*.ckpt
+*.npz
+*.sqlite3
+data/
+datasets/
+
+# Benchmark output
+benchmarks/*.json
+trace.json
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
