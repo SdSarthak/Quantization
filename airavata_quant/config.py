@@ -10,9 +10,10 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Mapping, Optional
+from typing import Dict, List, Mapping, Optional
 
 ENV_PREFIX = "AIRAVATA_"
+DOTENV_FILENAME = ".env"
 
 DEFAULT_MODEL_NAME = "ai4bharat/Airavata"
 VALID_DEVICES = ("auto", "cpu", "cuda")
@@ -23,6 +24,35 @@ _FALSE = {"0", "false", "no", "n", "off"}
 
 class ConfigError(ValueError):
     """Raised when an environment variable holds an unusable value."""
+
+
+def parse_dotenv(text: str) -> Dict[str, str]:
+    """Parse ``KEY=VALUE`` lines. Comments, blanks and ``export`` are tolerated."""
+    values: Dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :]
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def load_dotenv(path: Optional[Path] = None) -> Dict[str, str]:
+    """Read a ``.env`` file if present. Missing or unreadable files yield ``{}``."""
+    dotenv = Path(path or DOTENV_FILENAME)
+    try:
+        return parse_dotenv(dotenv.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return {}
 
 
 def _get(env: Mapping[str, str], name: str) -> Optional[str]:
@@ -98,7 +128,16 @@ class Settings:
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "Settings":
-        env = os.environ if env is None else env
+        """Build settings from ``env`` (defaults to the process environment).
+
+        When no mapping is supplied, a ``.env`` file in the working directory is
+        layered underneath the real environment, so exported variables always
+        win over the file.
+        """
+        if env is None:
+            merged = load_dotenv()
+            merged.update(os.environ)
+            env = merged
         defaults = cls()
 
         device = (_get(env, "DEVICE") or defaults.device).lower()

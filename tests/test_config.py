@@ -85,3 +85,51 @@ def test_ensure_directories_creates_all_paths(tmp_path):
     assert (tmp_path / "c").is_dir()
     assert (tmp_path / "q").is_dir()
     assert (tmp_path / "b").is_dir()
+
+
+def test_parse_dotenv_handles_comments_quotes_and_export():
+    from airavata_quant.config import parse_dotenv
+
+    parsed = parse_dotenv(
+        "\n".join(
+            [
+                "# a comment",
+                "",
+                "AIRAVATA_PORT=9100",
+                'export AIRAVATA_MODEL_NAME="org/quoted"',
+                "AIRAVATA_HOST = '0.0.0.0' ",
+                "not a pair",
+                "=novalue",
+            ]
+        )
+    )
+    assert parsed == {
+        "AIRAVATA_PORT": "9100",
+        "AIRAVATA_MODEL_NAME": "org/quoted",
+        "AIRAVATA_HOST": "0.0.0.0",
+    }
+
+
+def test_load_dotenv_returns_empty_for_a_missing_file(tmp_path):
+    from airavata_quant.config import load_dotenv
+
+    assert load_dotenv(tmp_path / "absent.env") == {}
+
+
+def test_load_dotenv_reads_a_real_file(tmp_path):
+    from airavata_quant.config import load_dotenv
+
+    path = tmp_path / ".env"
+    path.write_text("AIRAVATA_DEVICE=cpu\n", encoding="utf-8")
+    assert load_dotenv(path) == {"AIRAVATA_DEVICE": "cpu"}
+
+
+def test_process_environment_overrides_the_dotenv_file(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text(
+        "AIRAVATA_PORT=1111\nAIRAVATA_MODEL_NAME=org/from-file\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AIRAVATA_PORT", "2222")
+    settings = Settings.from_env()
+    assert settings.port == 2222
+    assert settings.model_name == "org/from-file"
