@@ -14,11 +14,12 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-from .benchmark import DEFAULT_PROMPTS, LatencySample, summarize
+from .benchmark import DEFAULT_PROMPTS, LatencySample, compare, summarize
 from .config import Settings
 from .quantization import (
     DYNAMIC_QUANT,
     ORIGINAL,
+    VARIANTS,
     Variant,
     get_variant,
     resolve_preload,
@@ -563,6 +564,66 @@ class ModelManager:
             "memory_usage": hardware.memory_usage(self.device.type),
             "hardware_info": hardware.hardware_info(str(self.device)),
         }
+
+    def benchmark_all(
+        self,
+        variants: Optional[Sequence[str]] = None,
+        iterations: int = 3,
+        prompts: Optional[Iterable[str]] = None,
+        max_new_tokens: int = 50,
+        free_after: bool = True,
+    ) -> Dict[str, Any]:
+        """Benchmark several variants, releasing the ones the sweep loaded.
+
+        Without ``free_after`` the sweep holds every variant resident at once,
+        so on a card that fits exactly one copy of the weights - the normal
+        case for the model this serves - the second variant OOMs and the
+        comparison the endpoint exists to produce never materialises.
+
+        Variants that were already loaded before the sweep are left alone: they
+        were somebody else's decision. A variant another pending variant is
+        derived from is also kept, so the sweep does not pay to load it twice.
+        """
+        names = list(variants) if variants is not None else self.available_variants()
+        prompt_list = list(prompts) if prompts is not None else None
+        resident_before = set(self.models)
+
+        results: Dict[str, Dict[str, Any]] = {}
+        errors: Dict[str, str] = {}
+
+        for position, name in enumerate(names):
+            try:
+                results[name] = self.benchmark(
+                    name,
+                    iterations=iterations,
+                    prompts=prompt_list,
+                    max_new_tokens=max_new_tokens,
+                )
+            except Exception as exc:  # noqa: BLE001 - one variant failing is fine
+                errors[name] = str(exc)
+                logger.warning("benchmark of %s failed: %s", name, exc)
+
+            if free_after:
+                self._free_after_sweep(name, names[position + 1 :], resident_before)
+
+        return {"results": results, "errors": errors, "comparison": compare(results)}
+
+    def _free_after_sweep(
+        self, name: str, pending: Sequence[str], resident_before: set
+    ) -> None:
+        """Unload variants the sweep itself brought in and nothing else needs."""
+        needed_by_pending = {
+            ORIGINAL
+            for other in pending
+            if other in VARIANTS and get_variant(other).derived_from_original
+        }
+        for candidate in list(self.models):
+            if candidate in resident_before:
+                continue  # somebody else loaded it; not ours to evict
+            if candidate in pending or candidate in needed_by_pending:
+                continue
+            logger.debug("releasing %s after benchmarking %s", candidate, name)
+            self.unload(candidate)
 
     # ------------------------------------------------------------------
     # persistence

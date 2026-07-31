@@ -337,6 +337,63 @@ def test_dynamic_quant_reuses_the_already_loaded_baseline(settings):
     instance.shutdown()
 
 
+def test_sweep_releases_the_variants_it_loaded(manager):
+    """The sweep must fit on a device that holds one copy of the weights."""
+    sweep = manager.benchmark_all(iterations=1, prompts=["a"], max_new_tokens=2)
+
+    assert set(sweep["results"]) == {"original", "dynamic_quant"}
+    assert sweep["errors"] == {}
+    assert sweep["comparison"]["original"]["latency_speedup"] == pytest.approx(1.0)
+    assert manager.models == {}, "the sweep left variants resident"
+
+
+def test_sweep_keeps_variants_that_were_already_loaded(manager):
+    manager.ensure_loaded("original")
+    manager.benchmark_all(iterations=1, prompts=["a"], max_new_tokens=2)
+    # `original` was somebody else's decision; only sweep-loaded ones go.
+    assert set(manager.models) == {"original"}
+
+
+def test_sweep_keeps_the_baseline_while_a_derived_variant_is_pending(manager):
+    manager.benchmark_all(
+        variants=["original", "dynamic_quant"],
+        iterations=1,
+        prompts=["a"],
+        max_new_tokens=2,
+    )
+    # dynamic_quant is derived from original, so the baseline is loaded once.
+    assert manager.loaded_variants == ["original", "dynamic_quant"]
+
+
+def test_sweep_can_be_asked_to_keep_everything(manager):
+    manager.benchmark_all(
+        iterations=1, prompts=["a"], max_new_tokens=2, free_after=False
+    )
+    assert set(manager.models) == {"original", "dynamic_quant"}
+
+
+def test_sweep_records_a_failing_variant_without_aborting(settings):
+    class HalfBroken(StubManager):
+        def _load_variant(self, variant):
+            if variant.name == "dynamic_quant":
+                raise RuntimeError("out of memory")
+            return super()._load_variant(variant)
+
+    instance = HalfBroken(settings)
+    sweep = instance.benchmark_all(iterations=1, prompts=["a"], max_new_tokens=2)
+    assert set(sweep["results"]) == {"original"}
+    assert "out of memory" in sweep["errors"]["dynamic_quant"]
+    instance.shutdown()
+
+
+def test_sweep_rejects_an_unknown_variant_as_an_error_entry(manager):
+    sweep = manager.benchmark_all(
+        variants=["original", "int2"], iterations=1, prompts=["a"], max_new_tokens=2
+    )
+    assert "int2" in sweep["errors"]
+    assert "original" in sweep["results"]
+
+
 def test_preload_reports_failures_without_raising(settings):
     class PartiallyBroken(StubManager):
         def _load_variant(self, variant):

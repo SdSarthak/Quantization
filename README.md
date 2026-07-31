@@ -134,16 +134,30 @@ curl "http://localhost:8000/benchmark/all?iterations=3"
 
 Each run does a discarded warmup pass first, then times `iterations` sweeps over
 three prompts of increasing length. Throughput is total generated tokens over
-total wall time. `/benchmark/all` adds a `comparison` block:
+total wall time. `model_memory_mb` is the weight footprint of that variant
+alone, measured from its tensors — including the packed weights of a
+dynamically quantized model, which appear in neither `parameters()` nor
+`buffers()`. `memory_usage` next to it is whole-process and therefore not
+comparable between variants.
+
+`/benchmark/all` adds a `comparison` block:
 
 ```json
 {
   "comparison": {
-    "original": {"latency_speedup": 1.0, "throughput_ratio": 1.0},
-    "int4": {"latency_speedup": 2.7, "throughput_ratio": 2.7}
+    "original": {"latency_speedup": 1.0, "throughput_ratio": 1.0, "weight_memory_ratio": 1.0},
+    "int4": {"latency_speedup": 2.7, "throughput_ratio": 2.7, "weight_memory_ratio": 0.27}
   }
 }
 ```
+
+`weight_memory_ratio` is measured, not derived from the bit width, so a variant
+that quietly failed to quantize shows up as `1.0`.
+
+The sweep releases each variant once it has been measured, so it runs on a
+device that holds a single copy of the weights; pass `keep_loaded=true`
+(`--keep-loaded` on the CLI) to keep them resident. Variants that were already
+loaded before the sweep are never evicted.
 
 ### Status codes
 

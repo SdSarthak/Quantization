@@ -70,6 +70,15 @@ def _build_parser() -> argparse.ArgumentParser:
     bench.add_argument("--max-new-tokens", type=_positive_int, default=50)
     bench.add_argument("--prompt", action="append", dest="prompts")
     bench.add_argument("--output", type=Path, help="Write the JSON report here.")
+    bench.add_argument(
+        "--keep-loaded",
+        action="store_true",
+        help=(
+            "Keep every benchmarked variant in memory. By default each one is "
+            "released after it is measured so the sweep fits on a device that "
+            "holds a single copy of the weights."
+        ),
+    )
 
     export = sub.add_parser("export", help="Save a quantized variant to disk.")
     export.add_argument("variant")
@@ -152,49 +161,48 @@ def _cmd_serve(settings: Settings, reload: bool) -> int:
 
 
 def _cmd_benchmark(settings: Settings, args: argparse.Namespace) -> int:
-    from .benchmark import compare
     from .manager import ModelManager
 
     settings.ensure_directories()
     manager = ModelManager(settings)
-    variants = args.variants or manager.available_variants()
+    try:
+        sweep = manager.benchmark_all(
+            variants=args.variants or None,
+            iterations=args.iterations,
+            prompts=args.prompts,
+            max_new_tokens=args.max_new_tokens,
+            free_after=not args.keep_loaded,
+        )
+        for name, message in sweep["errors"].items():
+            print(f"benchmark of {name} failed: {message}", file=sys.stderr)
 
-    results = {}
-    errors = {}
-    for name in variants:
+        report = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "model_name": settings.model_name,
+            "device": str(manager.device),
+            "iterations": args.iterations,
+            "max_new_tokens": args.max_new_tokens,
+            **sweep,
+        }
+
+        output = args.output
+        if output is None:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            output = settings.benchmark_dir / f"benchmark-{stamp}.json"
         try:
-            results[name] = manager.benchmark(
-                name,
-                iterations=args.iterations,
-                prompts=args.prompts,
-                max_new_tokens=args.max_new_tokens,
-            )
-        except Exception as exc:  # noqa: BLE001 - report and continue
-            errors[name] = str(exc)
-            print(f"benchmark of {name} failed: {exc}", file=sys.stderr)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        except OSError as exc:
+            # A benchmark that ran is worth printing even if the report cannot
+            # be filed; do not throw the measurements away over a bad --output.
+            print(f"could not write the report to {output}: {exc}", file=sys.stderr)
+        else:
+            print(f"report written to {output}", file=sys.stderr)
 
-    report = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "model_name": settings.model_name,
-        "device": str(manager.device),
-        "iterations": args.iterations,
-        "max_new_tokens": args.max_new_tokens,
-        "results": results,
-        "comparison": compare(results),
-        "errors": errors,
-    }
-
-    output = args.output
-    if output is None:
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        output = settings.benchmark_dir / f"benchmark-{stamp}.json"
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(report, indent=2), encoding="utf-8")
-
-    print(json.dumps(report, indent=2))
-    print(f"\nreport written to {output}", file=sys.stderr)
-    manager.shutdown()
-    return 0 if results else 1
+        print(json.dumps(report, indent=2))
+        return 0 if report["results"] else 1
+    finally:
+        manager.shutdown()
 
 
 def _cmd_export(settings: Settings, args: argparse.Namespace) -> int:

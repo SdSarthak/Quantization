@@ -95,6 +95,53 @@ def test_benchmark_all_is_not_shadowed_by_the_parameterised_route(client):
     assert body["comparison"]["original"]["latency_speedup"] > 0
 
 
+def test_benchmark_all_releases_the_variants_it_loaded(client):
+    """Otherwise the sweep needs room for every variant at once."""
+    client.get("/benchmark/all?iterations=1&max_new_tokens=2")
+    assert client.get("/health").json()["loaded_models"] == []
+
+    client.get("/benchmark/all?iterations=1&max_new_tokens=2&keep_loaded=true")
+    assert client.get("/health").json()["loaded_models"] == [
+        "dynamic_quant",
+        "original",
+    ]
+
+
+def test_benchmark_reports_the_variant_weight_footprint(client):
+    body = client.get("/benchmark/original?iterations=1&max_new_tokens=2").json()
+    assert body["model_memory_mb"] > 0
+    assert body["peak_gpu_memory_mb"] is None
+
+
+def test_benchmark_all_compares_measured_memory(client):
+    body = client.get("/benchmark/all?iterations=1&max_new_tokens=2").json()
+    assert body["comparison"]["original"]["weight_memory_ratio"] == 1.0
+
+
+def test_generate_rejects_a_seed_torch_cannot_represent(client):
+    assert (
+        client.post(
+            "/generate/original", json={"prompt": "hi", "seed": 2**64}
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            "/generate/original", json={"prompt": "hi", "seed": 2**64 - 1}
+        ).status_code
+        == 200
+    )
+
+
+def test_generate_accepts_unicode_prompts(client):
+    response = client.post(
+        "/generate/original",
+        json={"prompt": "भारत के बारे में बताइए", "max_length": 2, "temperature": 0.0},
+    )
+    assert response.status_code == 200
+    assert response.json()["generated_tokens"] == 2
+
+
 def test_benchmark_unknown_variant_is_404(client):
     assert client.get("/benchmark/int2").status_code == 404
 

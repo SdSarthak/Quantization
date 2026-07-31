@@ -12,7 +12,6 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import __version__, hardware
-from .benchmark import compare
 from .config import Settings
 from .manager import ModelLoadError, ModelManager, VariantUnavailableError
 from .quantization import VARIANTS, UnknownVariantError, memory_ratio
@@ -177,33 +176,32 @@ def create_app(
     async def benchmark_all(
         iterations: int = Query(3, ge=1, le=100),
         max_new_tokens: int = Query(50, ge=1, le=2048),
+        keep_loaded: bool = Query(
+            False,
+            description=(
+                "Keep every benchmarked variant resident. Off by default so "
+                "the sweep fits on a device that holds one copy of the weights."
+            ),
+        ),
         manager: ModelManager = Depends(get_manager),
     ) -> BenchmarkAllResponse:
-        results: Dict[str, BenchmarkResponse] = {}
-        raw: Dict[str, Dict[str, float]] = {}
-        errors: Dict[str, str] = {}
-
-        for name in manager.available_variants():
-            try:
-                stats = await _run(
-                    manager,
-                    manager.benchmark,
-                    name,
-                    iterations,
-                    None,
-                    max_new_tokens,
-                )
-            except Exception as exc:  # noqa: BLE001 - one variant failing is fine
-                errors[name] = str(exc)
-                continue
-            raw[name] = stats
-            results[name] = BenchmarkResponse(**stats)
-
+        sweep = await _run(
+            manager,
+            manager.benchmark_all,
+            None,
+            iterations,
+            None,
+            max_new_tokens,
+            not keep_loaded,
+        )
         return BenchmarkAllResponse(
             iterations=iterations,
-            results=results,
-            comparison=compare(raw),
-            errors=errors,
+            results={
+                name: BenchmarkResponse(**stats)
+                for name, stats in sweep["results"].items()
+            },
+            comparison=sweep["comparison"],
+            errors=sweep["errors"],
         )
 
     @app.get("/benchmark/{model_type}", response_model=BenchmarkResponse)
