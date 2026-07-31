@@ -337,6 +337,53 @@ def test_dynamic_quant_reuses_the_already_loaded_baseline(settings):
     instance.shutdown()
 
 
+class _Conv1DLike(nn.Module):
+    """Weights in a bare Parameter, like transformers' Conv1D blocks."""
+
+    def __init__(self, size: int = 64):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(size, size))
+
+
+def _manager_over(settings, module_factory):
+    class Fixed(ModelManager):
+        def load_tokenizer(self):
+            if self.tokenizer is None:
+                self.tokenizer = FakeTokenizer()
+            return self.tokenizer
+
+        def _load_original(self):
+            return module_factory()
+
+    return Fixed(settings)
+
+
+def test_dynamic_quant_refuses_an_architecture_it_cannot_shrink(settings):
+    """A silent no-op is worse than an error.
+
+    ``quantize_dynamic`` only converts ``nn.Linear``. GPT-2 style models keep
+    their weights in ``Conv1D``, so it hands back an all-but-untouched copy
+    and says nothing - and the variant is then served, benchmarked and
+    compared as though it had been quantized.
+    """
+    instance = _manager_over(settings, lambda: nn.Sequential(_Conv1DLike()))
+    with pytest.raises(ModelLoadError) as excinfo:
+        instance.ensure_loaded("dynamic_quant")
+    message = str(excinfo.value)
+    assert "did not shrink" in message
+    assert "0 nn.Linear layer(s) converted" in message
+    instance.shutdown()
+
+
+def test_dynamic_quant_accepts_an_architecture_it_does_shrink(settings):
+    instance = _manager_over(settings, lambda: nn.Sequential(nn.Linear(64, 64)))
+    quantized = instance.ensure_loaded("dynamic_quant")
+    assert model_memory_bytes(quantized) < model_memory_bytes(
+        instance.models["original"]
+    )
+    instance.shutdown()
+
+
 def test_sweep_releases_the_variants_it_loaded(manager):
     """The sweep must fit on a device that holds one copy of the weights."""
     sweep = manager.benchmark_all(iterations=1, prompts=["a"], max_new_tokens=2)

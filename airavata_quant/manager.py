@@ -314,9 +314,39 @@ class ModelManager:
         # even when a request for `original` is in flight on another thread, and
         # so it stays resident for /benchmark/all to compare against.
         base = self.ensure_loaded(ORIGINAL)
-        return torch.ao.quantization.quantize_dynamic(
+        quantized = torch.ao.quantization.quantize_dynamic(
             base, {nn.Linear}, dtype=torch.qint8
         )
+
+        converted = sum(
+            isinstance(module, torch.ao.nn.quantized.dynamic.Linear)
+            for module in quantized.modules()
+        )
+        before = model_memory_bytes(base)
+        after = model_memory_bytes(quantized)
+        if after >= before:
+            # Found by benchmarking a real GPT-2 checkpoint. torch only
+            # quantizes nn.Linear; GPT-2's attention and MLP are
+            # `transformers.pytorch_utils.Conv1D`, so quantize_dynamic returns
+            # an almost untouched copy and says nothing about it. The variant
+            # would then be served, benchmarked and compared as if it had been
+            # quantized - the measured footprint even grew by 4%, because
+            # quantizing the tied lm_head un-ties it from the embedding.
+            raise ModelLoadError(
+                f"dynamic quantization did not shrink {self.settings.model_name!r} "
+                f"({before / BYTES_PER_MB:.1f} MB -> {after / BYTES_PER_MB:.1f} MB "
+                f"with {converted} nn.Linear layer(s) converted): torch's dynamic "
+                "quantization only covers nn.Linear, and GPT-2 family models keep "
+                "their weights in Conv1D. Use the int8/int4 GPU variants for this "
+                "architecture"
+            )
+        logger.info(
+            "dynamic quantization converted %d layers: %.1f MB -> %.1f MB",
+            converted,
+            before / BYTES_PER_MB,
+            after / BYTES_PER_MB,
+        )
+        return quantized
 
     def preload(self, requested: Optional[Sequence[str]] = None) -> Dict[str, str]:
         """Load the configured variants up front.
