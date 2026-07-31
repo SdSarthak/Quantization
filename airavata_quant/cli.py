@@ -14,10 +14,23 @@ from .config import ConfigError, Settings
 
 
 def _configure_logging(level: str) -> None:
+    # "TRACE" is a uvicorn level with no stdlib equivalent; map it to DEBUG.
+    resolved = logging.DEBUG if level.upper() == "TRACE" else level.upper()
     logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
+        level=getattr(logging, resolved, logging.INFO) if isinstance(resolved, str) else resolved,
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
+
+
+def _positive_int(raw: str) -> int:
+    """argparse type that rejects 0/negatives up front instead of mid-benchmark."""
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {raw!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {value}")
+    return value
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -37,7 +50,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     serve = sub.add_parser("serve", help="Run the HTTP API.")
     serve.add_argument("--host")
-    serve.add_argument("--port", type=int)
+    serve.add_argument("--port", type=_positive_int)
     serve.add_argument(
         "--reload", action="store_true", help="Enable uvicorn autoreload."
     )
@@ -53,8 +66,8 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="*",
         help="Variant names to benchmark. Defaults to everything the device supports.",
     )
-    bench.add_argument("--iterations", type=int, default=3)
-    bench.add_argument("--max-new-tokens", type=int, default=50)
+    bench.add_argument("--iterations", type=_positive_int, default=3)
+    bench.add_argument("--max-new-tokens", type=_positive_int, default=50)
     bench.add_argument("--prompt", action="append", dest="prompts")
     bench.add_argument("--output", type=Path, help="Write the JSON report here.")
 
@@ -81,7 +94,9 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
         settings.port = args.port
     if getattr(args, "no_preload", False):
         settings.preload = []
-    return settings
+    # Assigning to dataclass fields skips __post_init__, so re-check the
+    # overrides rather than letting a bad --port or --log-level reach uvicorn.
+    return settings.validate()
 
 
 def _cmd_info(settings: Settings) -> int:

@@ -17,6 +17,10 @@ DOTENV_FILENAME = ".env"
 
 DEFAULT_MODEL_NAME = "ai4bharat/Airavata"
 VALID_DEVICES = ("auto", "cpu", "cuda")
+#: Levels ``logging`` understands *and* uvicorn accepts. ``uvicorn.run`` raises
+#: on anything else, so an unvalidated level turns into a traceback at startup.
+VALID_LOG_LEVELS = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "TRACE")
+MAX_PORT = 65535
 
 _TRUE = {"1", "true", "yes", "y", "on"}
 _FALSE = {"0", "false", "no", "n", "off"}
@@ -118,13 +122,40 @@ class Settings:
     hf_token: Optional[str] = None
 
     def __post_init__(self) -> None:
+        self.cache_dir = Path(self.cache_dir)
+        self.quantized_model_path = Path(self.quantized_model_path)
+        self.benchmark_dir = Path(self.benchmark_dir)
+        self.validate()
+
+    def validate(self) -> "Settings":
+        """Check every field that something downstream would otherwise crash on.
+
+        Called from ``__post_init__`` and again after the CLI applies its
+        overrides, since assigning to a dataclass field bypasses construction.
+        """
         if self.device not in VALID_DEVICES:
             raise ConfigError(
                 f"device must be one of {VALID_DEVICES}, got {self.device!r}"
             )
-        self.cache_dir = Path(self.cache_dir)
-        self.quantized_model_path = Path(self.quantized_model_path)
-        self.benchmark_dir = Path(self.benchmark_dir)
+        if self.log_level not in VALID_LOG_LEVELS:
+            raise ConfigError(
+                f"log_level must be one of {VALID_LOG_LEVELS}, got {self.log_level!r}"
+            )
+        if not 1 <= self.port <= MAX_PORT:
+            raise ConfigError(f"port must be between 1 and {MAX_PORT}, got {self.port}")
+        if not self.host.strip():
+            raise ConfigError("host must not be empty")
+        if not self.model_name.strip():
+            raise ConfigError("model_name must not be empty")
+        if self.max_input_tokens < 1:
+            raise ConfigError("max_input_tokens must be >= 1")
+        if self.max_new_tokens < 1:
+            raise ConfigError("max_new_tokens must be >= 1")
+        if self.max_return_sequences < 1:
+            raise ConfigError("max_return_sequences must be >= 1")
+        if self.max_workers < 1:
+            raise ConfigError("max_workers must be >= 1")
+        return self
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "Settings":

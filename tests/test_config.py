@@ -57,11 +57,28 @@ def test_blank_values_fall_back_to_defaults():
         {"AIRAVATA_PORT": "0"},
         {"AIRAVATA_USE_AMP": "maybe"},
         {"AIRAVATA_DEVICE": "tpu"},
+        # uvicorn raises on an unknown level, so catch it at config time.
+        {"AIRAVATA_LOG_LEVEL": "verbose"},
+        # 70000 binds nowhere; the socket error would come much later.
+        {"AIRAVATA_PORT": "70000"},
     ],
 )
 def test_invalid_values_raise_config_error(env):
     with pytest.raises(ConfigError):
         Settings.from_env(env)
+
+
+def test_validate_runs_again_after_fields_are_reassigned():
+    """Assigning to a dataclass field bypasses ``__post_init__``."""
+    settings = Settings()
+    settings.port = 99999
+    with pytest.raises(ConfigError, match="port"):
+        settings.validate()
+
+    settings.port = 8000
+    settings.log_level = "chatty"
+    with pytest.raises(ConfigError, match="log_level"):
+        settings.validate()
 
 
 def test_hf_token_read_from_prefixed_or_standard_variable():
