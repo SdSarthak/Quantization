@@ -20,6 +20,12 @@ Variants that the detected device cannot run are reported as unsupported rather
 than failing at request time. Anything not preloaded is loaded lazily on first
 use.
 
+`dynamic_quant` needs an architecture whose weights live in `nn.Linear` — LLaMA
+family models, which includes Airavata. GPT-2 family models keep theirs in
+`Conv1D`, which torch's dynamic quantization does not touch; loading the variant
+there fails with a `503` naming the reason rather than serving an unquantized
+copy under a quantized name.
+
 Beyond generation, the service exposes per-variant benchmarking with warmup,
 p50/p95 latency and aggregate throughput; a `/benchmark/all` sweep that returns a
 speedup table relative to the FP baseline; live CPU/RAM/GPU telemetry; and an

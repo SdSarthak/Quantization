@@ -5,8 +5,6 @@ number: monitoring endpoints run on hosts where psutil, nvidia-smi or the CUDA
 driver behave in surprising ways.
 """
 
-import pytest
-
 from airavata_quant import hardware
 
 
