@@ -75,19 +75,28 @@ def compare(results: Dict[str, Dict[str, float]], baseline: str = "original") ->
     Variants missing from ``results`` are skipped; if the baseline itself is
     absent an empty mapping is returned rather than raising, so ``/benchmark/all``
     still works on a box where the FP model did not fit.
+
+    ``weight_memory_ratio`` is the *measured* weight footprint against the
+    baseline's, so it can be checked against the theoretical ratio implied by
+    the bit width - a variant that silently failed to quantize shows up as 1.0.
     """
     base = results.get(baseline)
     if not base or not base.get("avg_latency"):
         return {}
 
+    base_memory = base.get("model_memory_mb") or 0.0
     comparison: Dict[str, Dict[str, float]] = {}
     for name, stats in results.items():
         avg = stats.get("avg_latency") or 0.0
         throughput = stats.get("throughput") or 0.0
-        comparison[name] = {
+        memory = stats.get("model_memory_mb") or 0.0
+        entry = {
             "latency_speedup": (base["avg_latency"] / avg) if avg > 0 else 0.0,
             "throughput_ratio": (
                 throughput / base["throughput"] if base.get("throughput") else 0.0
             ),
         }
+        if base_memory > 0 and memory > 0:
+            entry["weight_memory_ratio"] = memory / base_memory
+        comparison[name] = entry
     return comparison

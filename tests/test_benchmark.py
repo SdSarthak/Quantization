@@ -57,3 +57,32 @@ def test_compare_reports_speedup_against_the_baseline():
 
 def test_compare_returns_empty_when_the_baseline_is_missing():
     assert compare({"int4": {"avg_latency": 0.5, "throughput": 1.0}}) == {}
+
+
+def test_compare_reports_the_measured_weight_memory_ratio():
+    results = {
+        "original": {"avg_latency": 1.0, "throughput": 100.0, "model_memory_mb": 800.0},
+        "int4": {"avg_latency": 0.5, "throughput": 200.0, "model_memory_mb": 200.0},
+    }
+    comparison = compare(results)
+    assert comparison["int4"]["weight_memory_ratio"] == pytest.approx(0.25)
+    assert comparison["original"]["weight_memory_ratio"] == pytest.approx(1.0)
+
+
+def test_compare_omits_the_memory_ratio_when_it_was_not_measured():
+    results = {
+        "original": {"avg_latency": 1.0, "throughput": 100.0},
+        "int4": {"avg_latency": 0.5, "throughput": 200.0, "model_memory_mb": 200.0},
+    }
+    comparison = compare(results)
+    assert "weight_memory_ratio" not in comparison["int4"]
+    assert comparison["int4"]["latency_speedup"] == pytest.approx(2.0)
+
+
+def test_compare_survives_a_variant_that_recorded_no_latency():
+    results = {
+        "original": {"avg_latency": 1.0, "throughput": 100.0},
+        "broken": {"avg_latency": 0.0, "throughput": 0.0},
+    }
+    comparison = compare(results)
+    assert comparison["broken"] == {"latency_speedup": 0.0, "throughput_ratio": 0.0}

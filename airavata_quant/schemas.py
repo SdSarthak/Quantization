@@ -20,7 +20,9 @@ class GenerationRequest(BaseModel):
     temperature: float = Field(0.7, ge=0.0, le=2.0)
     top_p: float = Field(0.9, gt=0.0, le=1.0)
     num_return_sequences: int = Field(1, ge=1, le=10)
-    seed: Optional[int] = Field(None, ge=0)
+    #: Upper bound matches what ``torch.manual_seed`` accepts; anything larger
+    #: raises deep inside torch and would surface as a 500.
+    seed: Optional[int] = Field(None, ge=0, le=2**64 - 1)
 
 
 class GenerationResponse(BaseModel):
@@ -61,6 +63,10 @@ class BenchmarkResponse(BaseModel):
     p95_latency: float
     throughput: float
     total_tokens: int
+    #: Weight footprint of this variant alone, which is what makes variants
+    #: comparable; ``memory_usage`` below is whole-process.
+    model_memory_mb: float
+    peak_gpu_memory_mb: Optional[float] = None
     memory_usage: MemoryUsage
     hardware_info: HardwareInfo
 
