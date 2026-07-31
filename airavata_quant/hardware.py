@@ -35,11 +35,27 @@ def cpu_frequency_mhz() -> Optional[float]:
     return float(freq.current) if freq else None
 
 
+_cpu_percent_primed = False
+
+
 def cpu_info(sample_interval: float = 0.0) -> Dict[str, Optional[float]]:
-    """CPU counters. ``sample_interval`` of 0 returns a non-blocking reading."""
+    """CPU counters. ``sample_interval`` of 0 returns a non-blocking reading.
+
+    ``psutil.cpu_percent(interval=None)`` is differential: the *first* call in a
+    process has no previous sample to diff against and always answers ``0.0``.
+    Priming it once means the first ``/system/info`` request reports real load
+    instead of a permanently idle CPU.
+    """
+    global _cpu_percent_primed
+    if not _cpu_percent_primed and not sample_interval:
+        psutil.cpu_percent(interval=None)
+        _cpu_percent_primed = True
+        usage = psutil.cpu_percent(interval=0.05)
+    else:
+        usage = psutil.cpu_percent(interval=sample_interval or None)
     return {
         "count": psutil.cpu_count(),
-        "usage_percent": psutil.cpu_percent(interval=sample_interval or None),
+        "usage_percent": usage,
         "frequency_mhz": cpu_frequency_mhz(),
     }
 
@@ -65,11 +81,17 @@ def _gputil_stats() -> Dict[str, Optional[float]]:
     if not gpus:
         return {}
     gpu = gpus[0]
+    # `if gpu.temperature` would discard a genuine 0 C reading, and `gpu.load`
+    # is None rather than 0.0 when the driver does not report utilisation.
     return {
         "memory_used_mb": float(gpu.memoryUsed),
         "memory_total_mb": float(gpu.memoryTotal),
-        "utilization_percent": float(gpu.load) * 100.0,
-        "temperature_c": float(gpu.temperature) if gpu.temperature else None,
+        "utilization_percent": (
+            float(gpu.load) * 100.0 if gpu.load is not None else None
+        ),
+        "temperature_c": (
+            float(gpu.temperature) if gpu.temperature is not None else None
+        ),
     }
 
 
