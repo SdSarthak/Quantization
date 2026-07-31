@@ -125,7 +125,7 @@ def _cmd_info(settings: Settings) -> int:
                 "description": variant.description,
                 "requires_device": variant.requires_device,
                 "supported_here": manager.supports(name),
-                "relative_weight_memory": memory_ratio(name),
+                "relative_weight_memory": memory_ratio(name, manager.device.type),
             }
             for name, variant in VARIANTS.items()
         },

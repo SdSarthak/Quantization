@@ -59,6 +59,25 @@ def test_memory_ratio_matches_bit_width():
     assert memory_ratio(INT4) == 0.25
 
 
+def test_memory_ratio_uses_the_baseline_of_the_device_the_variant_runs_on():
+    """The CPU baseline is FP32, not FP16.
+
+    Reporting ``dynamic_quant`` as 0.5 understated the saving by 2x: int8
+    against an FP32 baseline is a quarter of the weights, which is what the
+    measured footprint in the benchmark shows.
+    """
+    assert memory_ratio(DYNAMIC_QUANT, "cpu") == 0.25
+    assert memory_ratio(DYNAMIC_QUANT) == 0.25  # cpu-only, so device-independent
+
+    # GPU-only variants always compare against FP16, even when inspected from
+    # a CPU host where they cannot run.
+    assert memory_ratio(INT4, "cpu") == 0.25
+    assert memory_ratio(INT8, "cuda") == 0.5
+
+    assert memory_ratio(ORIGINAL, "cpu") == 1.0
+    assert memory_ratio(ORIGINAL, "cuda") == 1.0
+
+
 def test_dynamic_quant_is_flagged_as_not_serializable():
     assert get_variant(DYNAMIC_QUANT).serializable is False
     assert get_variant(DYNAMIC_QUANT).derived_from_original is True

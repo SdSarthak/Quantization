@@ -18,6 +18,8 @@ def test_models_lists_support_per_device(client):
     assert variants["int4"]["supported"] is False
     assert variants["int4"]["requires_device"] == "cuda"
     assert variants["int4"]["relative_weight_memory"] == 0.25
+    # int8 against this host's FP32 baseline, not against FP16.
+    assert variants["dynamic_quant"]["relative_weight_memory"] == 0.25
 
 
 def test_generate_returns_only_the_continuation(client):

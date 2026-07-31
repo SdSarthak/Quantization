@@ -135,6 +135,29 @@ def resolve_preload(requested: List[str], device_type: str) -> List[str]:
     return resolved
 
 
-def memory_ratio(name: str) -> float:
-    """Weight-memory footprint of a variant relative to the FP16 baseline."""
-    return get_variant(name).bits / VARIANTS[ORIGINAL].bits
+#: The baseline is FP16 on CUDA but FP32 on CPU, so "how much smaller is this
+#: than the baseline" depends on where you are standing.
+BASELINE_BITS = {"cuda": 16, "cpu": 32}
+
+
+def baseline_bits(device_type: Optional[str] = None) -> int:
+    """Bits per weight of the ``original`` variant on ``device_type``."""
+    if device_type is None:
+        return VARIANTS[ORIGINAL].bits
+    return BASELINE_BITS.get(device_type, VARIANTS[ORIGINAL].bits)
+
+
+def memory_ratio(name: str, device_type: Optional[str] = None) -> float:
+    """Weight-memory footprint of a variant relative to the baseline.
+
+    Each variant is measured against the baseline *on the device it runs on*,
+    because that is the only comparison anyone can act on. It matters:
+    ``dynamic_quant`` is int8 against an FP32 CPU baseline, so it saves ~4x,
+    not the ~2x you get from comparing it with the FP16 figure the registry
+    records for GPU hosts. ``int4`` stays at 0.25 either way, since it can only
+    ever run against an FP16 baseline.
+    """
+    variant = get_variant(name)
+    reference = variant.requires_device or device_type
+    baseline = baseline_bits(reference)
+    return baseline / baseline if name == ORIGINAL else variant.bits / baseline

@@ -151,7 +151,9 @@ def create_app(
                     requires_device=variant.requires_device,
                     supported=manager.supports(variant.name),
                     loaded=variant.name in manager.models,
-                    relative_weight_memory=memory_ratio(variant.name),
+                    relative_weight_memory=memory_ratio(
+                        variant.name, manager.device.type
+                    ),
                 )
                 for variant in VARIANTS.values()
             ],
