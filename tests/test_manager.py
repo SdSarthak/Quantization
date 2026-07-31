@@ -1,5 +1,6 @@
 import pytest
 import torch
+import torch.nn as nn
 
 from airavata_quant.config import Settings
 from airavata_quant.manager import (
@@ -7,11 +8,12 @@ from airavata_quant.manager import (
     ModelManager,
     VariantUnavailableError,
     build_bnb_config,
+    model_memory_bytes,
 )
 from airavata_quant.quantization import INT4, INT8, UnknownVariantError, get_variant
 from airavata_quant.schemas import GenerationRequest
 
-from .conftest import PAD_ID, PROMPT_IDS, StubManager
+from .conftest import EOS_ID, PAD_ID, PROMPT_IDS, FakeModel, FakeTokenizer, StubManager
 
 
 def test_bnb_config_resolves_string_dtypes_to_torch_dtypes():
@@ -87,6 +89,107 @@ def test_generate_excludes_padding_from_the_token_count(settings):
     assert result["generated_tokens"] == 3
     assert str(PAD_ID) not in result["generated_text"][0].split()
     padded.shutdown()
+
+
+def test_a_trailing_eos_counts_as_a_generated_token_when_pad_is_eos(manager):
+    """Checkpoints without a pad token reuse EOS as pad.
+
+    Counting "every token that is not the pad id" therefore threw away the
+    terminating EOS the model really did generate, under-reporting throughput
+    by one token per sequence.
+    """
+    count = ModelManager._count_generated(
+        torch.tensor([10, 11, EOS_ID, EOS_ID, EOS_ID]), pad_id=EOS_ID, eos_id=EOS_ID
+    )
+    assert count == 3
+
+
+def test_pad_valued_tokens_inside_the_continuation_are_counted(manager):
+    count = ModelManager._count_generated(
+        torch.tensor([10, PAD_ID, 11, PAD_ID, PAD_ID]), pad_id=PAD_ID, eos_id=EOS_ID
+    )
+    assert count == 3
+
+
+def test_token_count_without_a_pad_token_uses_the_full_length():
+    assert (
+        ModelManager._count_generated(
+            torch.tensor([1, 2, 3]), pad_id=None, eos_id=None
+        )
+        == 3
+    )
+    assert ModelManager._count_generated(torch.tensor([], dtype=torch.long), 0, 0) == 0
+
+
+def test_generate_rejects_a_prompt_that_tokenizes_to_nothing(settings):
+    class EmptyTokenizer(FakeTokenizer):
+        def __call__(self, prompt, **kwargs):
+            ids = torch.zeros((1, 0), dtype=torch.long)
+            return {"input_ids": ids, "attention_mask": ids}
+
+    class EmptyManager(StubManager):
+        def load_tokenizer(self):
+            if self.tokenizer is None:
+                self.tokenizer = EmptyTokenizer()
+            return self.tokenizer
+
+    instance = EmptyManager(settings)
+    with pytest.raises(ValueError, match="zero tokens"):
+        instance.generate("original", GenerationRequest(prompt="​", max_length=2))
+    instance.shutdown()
+
+
+class _RandomModel(FakeModel):
+    """Consumes the global RNG so seeding is observable."""
+
+    def generate(self, input_ids=None, attention_mask=None, **kwargs):
+        self.draws.append(float(torch.rand(1)))
+        return super().generate(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+
+    def __init__(self, pad_tail: int = 0) -> None:
+        super().__init__(pad_tail=pad_tail)
+        self.draws = []
+
+
+def _random_manager(settings):
+    class RandomManager(StubManager):
+        def _load_variant(self, variant):
+            self.loaded_variants.append(variant.name)
+            return _RandomModel()
+
+    return RandomManager(settings)
+
+
+def test_the_same_seed_reproduces_the_same_draws(settings):
+    instance = _random_manager(settings)
+    for _ in range(2):
+        instance.generate(
+            "original", GenerationRequest(prompt="x", max_length=2, seed=1234)
+        )
+    draws = instance.models["original"].draws
+    assert draws[0] == draws[1]
+    instance.shutdown()
+
+
+def test_a_seeded_request_does_not_hijack_the_global_rng(settings):
+    """A seed must scope to its own request.
+
+    ``torch.manual_seed`` is process-global: without isolation one seeded
+    request silently pins every concurrent unseeded request to the same
+    stream, which is both wrong and a reproducibility trap.
+    """
+    instance = _random_manager(settings)
+    instance.ensure_loaded("original")  # module init also draws; get it out of the way
+
+    torch.manual_seed(999)
+    before = float(torch.rand(1))
+
+    torch.manual_seed(999)
+    instance.generate("original", GenerationRequest(prompt="x", max_length=2, seed=7))
+    after = float(torch.rand(1))
+
+    assert before == after
+    instance.shutdown()
 
 
 def test_greedy_decoding_omits_sampling_parameters(manager):
@@ -169,6 +272,69 @@ def test_benchmark_rejects_bad_arguments(manager):
         manager.benchmark("original", iterations=0)
     with pytest.raises(ValueError):
         manager.benchmark("original", prompts=[])
+
+
+def test_model_memory_counts_dynamically_quantized_weights():
+    """A qint8 model must not be reported as occupying nothing.
+
+    ``quantize_dynamic`` moves the weight into a packed script object, so it
+    appears in neither ``parameters()`` nor ``buffers()``; a naive walk answers
+    0 bytes and the whole point of the benchmark - showing the memory saving -
+    silently evaporates.
+    """
+    fp32 = nn.Sequential(nn.Linear(128, 128), nn.Linear(128, 64))
+    quantized = torch.ao.quantization.quantize_dynamic(
+        fp32, {nn.Linear}, dtype=torch.qint8
+    )
+
+    fp32_bytes = model_memory_bytes(fp32)
+    quantized_bytes = model_memory_bytes(quantized)
+
+    assert fp32_bytes == pytest.approx((128 * 128 + 128 * 64) * 4 + (128 + 64) * 4)
+    assert quantized_bytes > 0
+    # int8 weights with fp32 biases: roughly a quarter of the fp32 footprint.
+    assert 0.2 < quantized_bytes / fp32_bytes < 0.4
+
+
+def test_benchmark_reports_the_variant_weight_footprint(manager):
+    stats = manager.benchmark(
+        "original", iterations=1, prompts=["a"], max_new_tokens=2, warmup=0
+    )
+    expected = model_memory_bytes(manager.models["original"]) / (1024 * 1024)
+    assert stats["model_memory_mb"] == pytest.approx(expected)
+    assert stats["model_memory_mb"] > 0
+    assert stats["peak_gpu_memory_mb"] is None  # CPU run
+
+
+def test_dynamic_quant_reuses_the_already_loaded_baseline(settings):
+    """Exercises the real quantization path, not the stubbed loader."""
+
+    class RealQuantManager(ModelManager):
+        def __init__(self, s):
+            super().__init__(s)
+            self.original_loads = 0
+
+        def load_tokenizer(self):
+            if self.tokenizer is None:
+                self.tokenizer = FakeTokenizer()
+            return self.tokenizer
+
+        def _load_original(self):
+            self.original_loads += 1
+            return nn.Sequential(nn.Linear(32, 32))
+
+    instance = RealQuantManager(settings)
+    quantized = instance.ensure_loaded("dynamic_quant")
+
+    assert instance.original_loads == 1
+    assert "original" in instance.models  # the FP baseline stays for comparison
+    assert isinstance(quantized[0], torch.ao.nn.quantized.dynamic.Linear)
+    assert model_memory_bytes(quantized) < model_memory_bytes(instance.models["original"])
+
+    # A second variant request must not re-load the baseline.
+    instance.ensure_loaded("original")
+    assert instance.original_loads == 1
+    instance.shutdown()
 
 
 def test_preload_reports_failures_without_raising(settings):

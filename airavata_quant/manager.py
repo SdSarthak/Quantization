@@ -61,11 +61,55 @@ def build_bnb_config(variant: Variant) -> Optional[BitsAndBytesConfig]:
     return BitsAndBytesConfig(**kwargs)
 
 
+def _packed_parameter_bytes(model: Any) -> int:
+    """Bytes held by quantized modules that hide their weights from ``parameters()``.
+
+    ``torch.ao.quantization.quantize_dynamic`` replaces ``nn.Linear`` with a
+    module whose weight lives in a ``LinearPackedParams`` script object. It is
+    neither a parameter nor a buffer, so a naive walk reports a dynamically
+    quantized model as occupying *zero* bytes.
+    """
+    total = 0
+    for module in model.modules():
+        packed = getattr(module, "_packed_params", None)
+        # The script object one level down has no such accessor; skip it.
+        weight_bias = getattr(packed, "_weight_bias", None)
+        if weight_bias is None:
+            continue
+        try:
+            tensors = weight_bias()
+        except (RuntimeError, AttributeError, TypeError):  # pragma: no cover
+            logger.debug("could not read packed params of %r", module, exc_info=True)
+            continue
+        for tensor in tensors:
+            if tensor is not None:
+                total += tensor.numel() * tensor.element_size()
+    return total
+
+
+def model_memory_bytes(model: Any) -> int:
+    """Bytes of weights held by ``model``.
+
+    This is the number a quantization benchmark actually needs: process RSS and
+    ``torch.cuda.memory_allocated`` both include every *other* variant loaded in
+    the same process, so they cannot be compared across variants.
+    ``nn.Module.parameters()`` already de-duplicates tied weights.
+    """
+    total = 0
+    for tensor in model.parameters():
+        total += tensor.numel() * tensor.element_size()
+    for tensor in model.buffers():
+        total += tensor.numel() * tensor.element_size()
+    return total + _packed_parameter_bytes(model)
+
+
 class ModelManager:
     """Owns the tokenizer and every loaded model variant.
 
-    Loading is lazy and guarded by a lock so two concurrent requests for the
-    same variant do not both pull a multi-gigabyte checkpoint into memory.
+    Loading is lazy and guarded by a *per-variant* lock so two concurrent
+    requests for the same variant do not both pull a multi-gigabyte checkpoint
+    into memory, while a request for an already-resident variant is never made
+    to queue behind an unrelated download.
     """
 
     def __init__(self, settings: Optional[Settings] = None) -> None:
@@ -73,7 +117,12 @@ class ModelManager:
         self.models: Dict[str, Any] = {}
         self.tokenizer = None
         self.device = self._resolve_device(self.settings.device)
+        #: Guards the registry itself (``models``/``tokenizer``/``_variant_locks``).
+        #: Never held across a load.
         self._lock = threading.RLock()
+        self._variant_locks: Dict[str, threading.RLock] = {}
+        #: Serialises generations that pin the global torch RNG; see ``_seeded``.
+        self._seed_lock = threading.Lock()
         self._executor = None
 
     # ------------------------------------------------------------------
@@ -113,6 +162,7 @@ class ModelManager:
         with self._lock:
             self.models.clear()
             self.tokenizer = None
+            self._variant_locks.clear()
         if self._executor is not None:
             self._executor.shutdown(wait=True)
             self._executor = None
@@ -157,6 +207,14 @@ class ModelManager:
                 self.tokenizer = tokenizer
             return self.tokenizer
 
+    def _variant_lock(self, name: str) -> threading.RLock:
+        with self._lock:
+            lock = self._variant_locks.get(name)
+            if lock is None:
+                lock = threading.RLock()
+                self._variant_locks[name] = lock
+            return lock
+
     def ensure_loaded(self, name: str) -> Any:
         """Return a loaded model, loading it on first use.
 
@@ -170,7 +228,13 @@ class ModelManager:
                 f"this host is running on {self.device.type}"
             )
 
-        with self._lock:
+        # Fast path: dict lookups are atomic under the GIL, so a resident model
+        # is returned without touching any lock.
+        model = self.models.get(name)
+        if model is not None:
+            return model
+
+        with self._variant_lock(name):
             model = self.models.get(name)
             if model is not None:
                 return model
@@ -178,12 +242,17 @@ class ModelManager:
             self.load_tokenizer()
             try:
                 model = self._load_variant(variant)
+            except (ModelLoadError, VariantUnavailableError):
+                # Already actionable (e.g. raised by a dependency load); do not
+                # bury it under a second layer of wrapping.
+                raise
             except Exception as exc:  # noqa: BLE001 - surfaced as ModelLoadError
                 logger.exception("failed to load variant %s", name)
                 raise ModelLoadError(f"could not load {name!r}: {exc}") from exc
 
             model.eval()
-            self.models[name] = model
+            with self._lock:
+                self.models[name] = model
             return model
 
     def _load_variant(self, variant: Variant) -> Any:
@@ -240,13 +309,10 @@ class ModelManager:
 
     def _load_dynamic_quant(self) -> Any:
         logger.info("applying dynamic quantization on CPU")
-        base = self.models.get(ORIGINAL)
-        if base is None:
-            base = self._load_original()
-            base.eval()
-            # Keep the FP baseline around so /benchmark/all can compare the
-            # two; it was already paid for.
-            self.models[ORIGINAL] = base
+        # Route through ensure_loaded so the FP baseline is loaded exactly once
+        # even when a request for `original` is in flight on another thread, and
+        # so it stays resident for /benchmark/all to compare against.
+        base = self.ensure_loaded(ORIGINAL)
         return torch.ao.quantization.quantize_dynamic(
             base, {nn.Linear}, dtype=torch.qint8
         )
@@ -288,6 +354,26 @@ class ModelManager:
             return torch.autocast(device_type="cuda", dtype=torch.float16)
         return contextlib.nullcontext()
 
+    @contextlib.contextmanager
+    def _seeded(self, seed: Optional[int]):
+        """Apply ``seed`` to the torch RNG without leaking it out of the call.
+
+        ``torch.manual_seed`` mutates process-global state. Without this, a
+        seeded request silently makes every *concurrent* unseeded request
+        deterministic, and two overlapping seeded requests interleave their
+        draws so neither is reproducible - the exact opposite of what asking
+        for a seed means. Seeded generations are therefore serialised against
+        each other; unseeded ones are untouched and stay fully parallel.
+        """
+        if seed is None:
+            yield
+            return
+        devices = [self.device] if self.device.type == "cuda" else []
+        with self._seed_lock:
+            with torch.random.fork_rng(devices=devices, enabled=True):
+                torch.manual_seed(seed)
+                yield
+
     def _encode(self, prompt: str) -> Dict[str, torch.Tensor]:
         tokenizer = self.load_tokenizer()
         encoded = tokenizer(
@@ -296,7 +382,14 @@ class ModelManager:
             truncation=True,
             max_length=self.settings.max_input_tokens,
         )
-        return {key: value.to(self.device) for key, value in encoded.items()}
+        inputs = {key: value.to(self.device) for key, value in encoded.items()}
+        input_ids = inputs.get("input_ids")
+        if input_ids is None or input_ids.numel() == 0:
+            raise ValueError(
+                "the prompt tokenized to zero tokens; provide text the "
+                "tokenizer can encode"
+            )
+        return inputs
 
     def generate(self, model_type: str, request: GenerationRequest) -> GenerationResult:
         """Run generation and report timing measured around the model call."""
@@ -313,9 +406,6 @@ class ModelManager:
                 f"num_return_sequences {request.num_return_sequences} exceeds the "
                 f"configured limit of {self.settings.max_return_sequences}"
             )
-
-        if request.seed is not None:
-            torch.manual_seed(request.seed)
 
         inputs = self._encode(request.prompt)
         prompt_tokens = int(inputs["input_ids"].shape[-1])
@@ -335,7 +425,7 @@ class ModelManager:
 
         start = time.perf_counter()
         with torch.inference_mode():
-            with self._autocast(model_type):
+            with self._seeded(request.seed), self._autocast(model_type):
                 outputs = model.generate(**inputs, **gen_kwargs)
         if self.device.type == "cuda":
             # generate() is synchronous, but be explicit so timings are not
@@ -356,6 +446,32 @@ class ModelManager:
             device=str(self.device),
         )
 
+    @staticmethod
+    def _count_generated(
+        continuation: torch.Tensor, pad_id: Optional[int], eos_id: Optional[int]
+    ) -> int:
+        """Number of tokens the model actually produced in ``continuation``.
+
+        Only the *trailing* run of padding is discarded. Counting every
+        non-pad token instead (the obvious version) is wrong twice over: it
+        drops pad-valued tokens the model legitimately emitted mid-sequence,
+        and because ``pad_token`` is set to ``eos_token`` for the many
+        checkpoints that ship without one, it also drops the terminating EOS
+        the model spent a forward pass computing.
+        """
+        length = int(continuation.numel())
+        if pad_id is None or length == 0:
+            return length
+
+        values = continuation.tolist()
+        end = length
+        while end > 0 and values[end - 1] == pad_id:
+            end -= 1
+        if end < length and eos_id == pad_id:
+            # The first token of the trailing run was a real generated EOS.
+            end += 1
+        return end
+
     def _decode(
         self, outputs: torch.Tensor, prompt_tokens: int, tokenizer
     ) -> Tuple[List[str], int]:
@@ -366,6 +482,7 @@ class ModelManager:
         decoded prompt a different length than the prompt that went in.
         """
         pad_id = tokenizer.pad_token_id
+        eos_id = tokenizer.eos_token_id
         texts: List[str] = []
         generated_tokens = 0
         for sequence in outputs:
@@ -373,10 +490,7 @@ class ModelManager:
             texts.append(
                 tokenizer.decode(continuation, skip_special_tokens=True).strip()
             )
-            if pad_id is None:
-                generated_tokens += int(continuation.numel())
-            else:
-                generated_tokens += int((continuation != pad_id).sum().item())
+            generated_tokens += self._count_generated(continuation, pad_id, eos_id)
         return texts, generated_tokens
 
     # ------------------------------------------------------------------
@@ -399,7 +513,7 @@ class ModelManager:
         if iterations < 1:
             raise ValueError("iterations must be >= 1")
 
-        self.ensure_loaded(model_type)
+        model = self.ensure_loaded(model_type)
         prompt_list = list(prompts) if prompts is not None else list(DEFAULT_PROMPTS)
         if not prompt_list:
             raise ValueError("benchmark requires at least one prompt")
@@ -414,6 +528,12 @@ class ModelManager:
 
         for _ in range(max(0, warmup)):
             run(prompt_list[0])
+
+        on_cuda = self.device.type == "cuda"
+        if on_cuda:
+            # Peak allocation is only meaningful when measured over the run
+            # itself; otherwise it reports whatever an earlier variant touched.
+            torch.cuda.reset_peak_memory_stats()
 
         samples: List[LatencySample] = []
         for _ in range(iterations):
@@ -433,6 +553,13 @@ class ModelManager:
             "model_type": model_type,
             "iterations": iterations,
             **stats,
+            # Weight footprint of *this* variant, unlike memory_usage below
+            # which is whole-process and therefore not comparable across
+            # variants loaded side by side.
+            "model_memory_mb": model_memory_bytes(model) / BYTES_PER_MB,
+            "peak_gpu_memory_mb": (
+                torch.cuda.max_memory_allocated() / BYTES_PER_MB if on_cuda else None
+            ),
             "memory_usage": hardware.memory_usage(self.device.type),
             "hardware_info": hardware.hardware_info(str(self.device)),
         }
