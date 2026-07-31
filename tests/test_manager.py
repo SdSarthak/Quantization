@@ -567,3 +567,28 @@ def test_quantized_variants_report_an_actionable_missing_dependency_error(
     with pytest.raises(ModelLoadError) as excinfo:
         instance.ensure_loaded("int4")
     assert "airavata-quant[gpu]" in str(excinfo.value)
+    assert "accelerate" in str(excinfo.value)
+
+
+def test_the_dependency_report_names_the_version_that_is_installed(monkeypatch):
+    """transformers says "pip install accelerate" even when it is installed.
+
+    Only the version is wrong, so the advice sends you in circles; the report
+    has to say what is actually present.
+    """
+    import airavata_quant.manager as manager_module
+
+    monkeypatch.setattr(
+        manager_module,
+        "_installed_version",
+        lambda package: "0.20.3" if package == "accelerate" else None,
+    )
+    report = manager_module.gpu_dependency_report()
+    assert "accelerate 0.20.3 (need >=0.24.0)" in report
+    assert "bitsandbytes missing" in report
+
+
+def test_the_dependency_report_reflects_the_real_environment():
+    from airavata_quant.manager import gpu_dependency_report
+
+    assert "accelerate" in gpu_dependency_report()

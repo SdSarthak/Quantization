@@ -62,6 +62,38 @@ def build_bnb_config(variant: Variant) -> Optional[BitsAndBytesConfig]:
     return BitsAndBytesConfig(**kwargs)
 
 
+#: Floors transformers itself enforces before it will use `device_map`/bnb.
+GPU_DEPENDENCIES = {"accelerate": "0.24.0", "bitsandbytes": "0.41.0"}
+
+
+def _installed_version(package: str) -> Optional[str]:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version(package)
+    except PackageNotFoundError:
+        return None
+
+
+def gpu_dependency_report() -> str:
+    """``accelerate 0.20.3 (need >=0.24.0), bitsandbytes missing``.
+
+    transformers raises a bare ``ImportError`` telling you to
+    ``pip install accelerate`` even when accelerate *is* installed and merely
+    too old - which is exactly the wrong instruction, and cost a full round of
+    debugging before this said which version was actually present.
+    """
+    parts = []
+    for package, minimum in GPU_DEPENDENCIES.items():
+        found = _installed_version(package)
+        parts.append(
+            f"{package} missing (need >={minimum})"
+            if found is None
+            else f"{package} {found} (need >={minimum})"
+        )
+    return ", ".join(parts)
+
+
 def _packed_parameter_bytes(model: Any) -> int:
     """Bytes held by quantized modules that hide their weights from ``parameters()``.
 
@@ -280,10 +312,11 @@ class ModelManager:
                 # device_map="auto" needs accelerate, but a single-GPU host does
                 # not: load onto the CPU and move the whole model across.
                 logger.warning(
-                    "accelerate is unavailable (%s); falling back to a "
-                    "single-device load. Install accelerate for multi-GPU "
-                    "sharding and CPU offload.",
+                    "accelerate is unusable (%s); found %s. Falling back to a "
+                    "single-device load; install/upgrade accelerate for "
+                    "multi-GPU sharding and CPU offload.",
                     exc,
+                    gpu_dependency_report(),
                 )
 
         model = AutoModelForCausalLM.from_pretrained(
@@ -304,8 +337,9 @@ class ModelManager:
             # Unlike the FP baseline there is no fallback here: bitsandbytes
             # quantization is applied during the accelerate-driven load.
             raise ModelLoadError(
-                f"{variant.name} needs accelerate and bitsandbytes: "
-                f"pip install 'airavata-quant[gpu]' ({exc})"
+                f"{variant.name} needs accelerate and bitsandbytes; found "
+                f"{gpu_dependency_report()}. Run: pip install -U "
+                f"'airavata-quant[gpu]' ({exc})"
             ) from exc
 
     def _load_dynamic_quant(self) -> Any:
